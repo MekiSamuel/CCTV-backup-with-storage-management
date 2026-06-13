@@ -1,0 +1,22 @@
+# Logs
+*.log
+*.log.*
+
+# Recordings / backup output (never commit video)
+CCTV-Backup/
+*.mp4
+*.mkv
+*.avi
+*.mov
+*.ts
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# OS
+Thumbs.db
+desktop.ini
+.DS_Store
