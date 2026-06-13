@@ -23,10 +23,12 @@ import logging.handlers
 import os
 import shutil
 import signal
+import socket
 import subprocess
 import threading
 import time
 from pathlib import Path
+from urllib.parse import urlparse
 
 import retention
 
@@ -36,6 +38,12 @@ LOG_PATH = APP_DIR / "cctv_backup.log"
 
 # Wait this long before restarting ffmpeg after it exits/crashes.
 RESTART_DELAY_SECONDS = 5
+
+# REMOTE EDITION: when the DVR can't be reached (e.g. Tailscale down or the
+# subnet route isn't approved), wait this long before re-checking, instead of
+# hammering ffmpeg with connection failures.
+REMOTE_RETRY_DELAY_SECONDS = 15
+REACHABILITY_TIMEOUT_SECONDS = 5
 
 log = logging.getLogger("cctv")
 _stop = threading.Event()
@@ -88,6 +96,22 @@ def get_cameras(cfg: configparser.ConfigParser):
     return cams
 
 
+def rtsp_host_port(url: str):
+    """Pull (host, port) out of an rtsp:// URL; default RTSP port is 554."""
+    p = urlparse(url)
+    return p.hostname, (p.port or 554)
+
+
+def is_reachable(host: str, port: int) -> bool:
+    """Quick TCP probe so we can give a clear 'is Tailscale up?' message
+    instead of a wall of ffmpeg connection errors."""
+    try:
+        with socket.create_connection((host, port), timeout=REACHABILITY_TIMEOUT_SECONDS):
+            return True
+    except OSError:
+        return False
+
+
 def build_ffmpeg_cmd(ffmpeg: str, url: str, out_dir: Path, seg_seconds: int, fmt: str):
     pattern = str(out_dir / f"%Y-%m-%d_%H-%M-%S.{fmt}")
     cmd = [
@@ -123,9 +147,20 @@ def record_camera(ffmpeg: str, name: str, url: str, backup_dir: Path,
     out_dir = backup_dir / name
     out_dir.mkdir(parents=True, exist_ok=True)
     cmd = build_ffmpeg_cmd(ffmpeg, url, out_dir, seg_seconds, fmt)
+    host, port = rtsp_host_port(url)
     log.info("[%s] recording to %s", name, out_dir)
 
     while not _stop.is_set():
+        # REMOTE EDITION: confirm the DVR is reachable before launching ffmpeg.
+        if host and not is_reachable(host, port):
+            log.warning(
+                "[%s] cannot reach DVR at %s:%s - is Tailscale up on this PC "
+                "(tailscale status) and the subnet route approved? Re-checking in %ds.",
+                name, host, port, REMOTE_RETRY_DELAY_SECONDS,
+            )
+            _stop.wait(REMOTE_RETRY_DELAY_SECONDS)
+            continue
+
         log.info("[%s] starting ffmpeg", name)
         try:
             proc = subprocess.Popen(
