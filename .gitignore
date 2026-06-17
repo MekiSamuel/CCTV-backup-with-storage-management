@@ -1,3 +1,7 @@
+# Local config - contains your camera username/password.
+# Use config.example.ini as the template; this file stays local only.
+config.ini
+
 # Logs
 *.log
 *.log.*

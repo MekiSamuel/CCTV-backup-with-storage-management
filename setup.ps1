@@ -18,6 +18,7 @@ $ErrorActionPreference = "Stop"
 $AppDir    = $PSScriptRoot
 $Script    = Join-Path $AppDir "cctv_backup.py"
 $Config    = Join-Path $AppDir "config.ini"
+$Example   = Join-Path $AppDir "config.example.ini"
 $TaskName  = "CCTV Backup Service"
 
 function Refresh-Path {
@@ -61,6 +62,18 @@ function Ensure-Ffmpeg {
 
 function Do-Install {
     Write-Host "=== Installing CCTV Backup ===" -ForegroundColor Cyan
+
+    # On a fresh clone there is no config.ini (it's git-ignored so passwords
+    # never get pushed). Seed it from the template and ask the user to edit it.
+    if (-not (Test-Path $Config)) {
+        if (Test-Path $Example) {
+            Copy-Item $Example $Config
+            Write-Warning "Created config.ini from the template. Edit it with your camera URL/password, then re-run .\setup.ps1"
+            return
+        } else {
+            throw "config.ini not found and no config.example.ini to copy from."
+        }
+    }
 
     Ensure-Ffmpeg
 
