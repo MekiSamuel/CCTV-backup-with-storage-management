@@ -95,6 +95,11 @@ def build_ffmpeg_cmd(ffmpeg: str, url: str, out_dir: Path, seg_seconds: int, fmt
         "-nostdin",
         "-loglevel", "warning",
         "-rtsp_transport", "tcp",   # TCP is far more reliable than UDP
+        # Give ffmpeg time/data to capture the keyframe + parameter sets before
+        # opening the file. Without this, long-GOP streams (Hikvision H.264+ /
+        # H.265+) fail at startup with "dimensions not set" and write nothing.
+        "-analyzeduration", "10000000",
+        "-probesize", "10000000",
         "-use_wallclock_as_timestamps", "1",
         "-i", url,
         "-c:v", "copy",             # video: never re-encode (low CPU, original quality)
