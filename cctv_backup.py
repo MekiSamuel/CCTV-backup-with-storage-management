@@ -17,6 +17,7 @@ Stop:
 
 from __future__ import annotations
 
+import collections
 import configparser
 import logging
 import logging.handlers
@@ -116,7 +117,6 @@ def build_ffmpeg_cmd(ffmpeg: str, url: str, out_dir: Path, seg_seconds: int, fmt
     pattern = str(out_dir / f"%Y-%m-%d_%H-%M-%S.{fmt}")
     cmd = [
         ffmpeg,
-        "-nostdin",
         "-loglevel", "warning",
         "-rtsp_transport", "tcp",   # TCP is far more reliable than UDP
         # Give ffmpeg time/data to capture the keyframe + parameter sets before
@@ -124,7 +124,6 @@ def build_ffmpeg_cmd(ffmpeg: str, url: str, out_dir: Path, seg_seconds: int, fmt
         # H.265+) fail at startup with "dimensions not set" and write nothing.
         "-analyzeduration", "10000000",
         "-probesize", "10000000",
-        "-use_wallclock_as_timestamps", "1",
         "-i", url,
         "-c:v", "copy",             # video: never re-encode (low CPU, original quality)
     ]
@@ -135,10 +134,12 @@ def build_ffmpeg_cmd(ffmpeg: str, url: str, out_dir: Path, seg_seconds: int, fmt
         cmd += ["-c:a", "aac"]
     else:
         cmd += ["-c:a", "copy"]     # mkv/ts can hold the original audio as-is
+    # Map our friendly extension to the actual ffmpeg muxer name.
+    seg_muxer = {"ts": "mpegts", "mkv": "matroska"}.get(fmt, fmt)
     cmd += [
         "-f", "segment",
         "-segment_time", str(seg_seconds),
-        "-segment_format", "mpegts" if fmt == "ts" else fmt,
+        "-segment_format", seg_muxer,
         "-reset_timestamps", "1",
         "-strftime", "1",
         pattern,
@@ -170,6 +171,7 @@ def record_camera(ffmpeg: str, name: str, url: str, backup_dir: Path,
         try:
             proc = subprocess.Popen(
                 cmd,
+                stdin=subprocess.PIPE,   # so we can send 'q' for a clean shutdown
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.PIPE,
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
@@ -178,6 +180,21 @@ def record_camera(ffmpeg: str, name: str, url: str, backup_dir: Path,
             log.error("[%s] failed to launch ffmpeg: %s", name, exc)
             _stop.wait(RESTART_DELAY_SECONDS)
             continue
+
+        # Drain ffmpeg's stderr continuously in a thread, keeping only a rolling
+        # tail. Without this the OS pipe buffer (~64 KB) fills and ffmpeg BLOCKS,
+        # stalling the recording. We keep the last lines for crash diagnostics.
+        tail = collections.deque(maxlen=40)
+
+        def _drain(pipe, sink):
+            try:
+                for raw in iter(pipe.readline, b""):
+                    sink.append(raw.decode("utf-8", "replace").rstrip())
+            except Exception:
+                pass
+
+        drainer = threading.Thread(target=_drain, args=(proc.stderr, tail), daemon=True)
+        drainer.start()
 
         # Block until ffmpeg exits or we are told to stop.
         while not _stop.is_set():
@@ -189,20 +206,25 @@ def record_camera(ffmpeg: str, name: str, url: str, backup_dir: Path,
 
         if _stop.is_set():
             log.info("[%s] stopping ffmpeg", name)
-            proc.terminate()
+            # Ask ffmpeg to quit gracefully ('q') so it finalizes the current
+            # clip; fall back to terminate/kill if it doesn't exit promptly.
             try:
-                proc.wait(timeout=10)
+                proc.stdin.write(b"q")
+                proc.stdin.flush()
+            except Exception:
+                pass
+            try:
+                proc.wait(timeout=8)
             except subprocess.TimeoutExpired:
-                proc.kill()
+                proc.terminate()
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
             return
 
         # ffmpeg exited on its own (stream dropped, camera rebooted, etc.)
-        err_tail = ""
-        if proc.stderr:
-            try:
-                err_tail = proc.stderr.read().decode("utf-8", "replace")[-500:].strip()
-            except Exception:
-                pass
+        err_tail = " | ".join(list(tail)[-5:])
         log.warning(
             "[%s] ffmpeg exited (code %s); restarting in %ds. %s",
             name, proc.returncode, RESTART_DELAY_SECONDS, err_tail,
